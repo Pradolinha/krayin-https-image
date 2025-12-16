@@ -1,35 +1,35 @@
 FROM webkul/krayin:2.1.5
 
-USER root
 WORKDIR /var/www/html/laravel-crm
 
-# Copia entrypoint que aplica permissões + caches no start (sem mexer no runtime do container)
-COPY docker/entrypoint.sh /usr/local/bin/krayin-entrypoint
-RUN chmod +x /usr/local/bin/krayin-entrypoint
-
-# Patch: força o Laravel a gerar URLs em https quando FORCE_HTTPS=true
-# (resolve blocked:mixed-content e “formulário não seguro”)
+# 1) Confiar no proxy (Traefik/Caddy) e aceitar X-Forwarded-* corretamente
 RUN set -eux; \
-  FILE="app/Providers/AppServiceProvider.php"; \
-  test -f "$FILE"; \
-  \
-  # garante import do URL
-  if ! grep -q "use Illuminate\\\\Support\\\\Facades\\\\URL;" "$FILE"; then \
-    sed -i '/^namespace App\\\\Providers;/a\
-\
-use Illuminate\\Support\\Facades\\URL;\
-' "$FILE"; \
-  fi; \
-  \
-  # injeta o forceScheme no boot (só se ainda não existir)
-  if ! grep -q "URL::forceScheme('https')" "$FILE"; then \
-    perl -0777 -i -pe "s/public function boot\\(\\)\\s*\\{\\s*/public function boot()\\n    {\\n        if (env('FORCE_HTTPS', false)) {\\n            URL::forceScheme('https');\\n        }\\n\\n/s" "$FILE"; \
+  FILE="app/Http/Middleware/TrustProxies.php"; \
+  if [ -f "$FILE" ]; then \
+    sed -i 's/protected \$proxies.*/protected $proxies = "\\x2a";/g' "$FILE" || true; \
+    sed -i 's/protected \$headers.*/protected $headers = Request::HEADER_X_FORWARDED_ALL;/g' "$FILE" || true; \
   fi
 
-# Healthcheck simples
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
-  CMD curl -fsS http://127.0.0.1/admin/login >/dev/null || exit 1
+# 2) Forçar HTTPS dentro do Laravel pra zerar mixed-content e “formulário não seguro”
+RUN php -r '
+$f="app/Providers/AppServiceProvider.php";
+$c=@file_get_contents($f);
+if($c===false){fwrite(STDERR,"Arquivo não encontrado: $f\n"); exit(1);}
 
-# Mantém o CMD/entrypoint do container base, mas roda nosso hook antes
-ENTRYPOINT ["/usr/local/bin/krayin-entrypoint"]
-CMD ["supervisord", "-n"]
+if(strpos($c,"use Illuminate\\\\Support\\\\Facades\\\\URL;")===false){
+  $c=preg_replace("/namespace App\\\\\\\\Providers;\\s*/",
+    "namespace App\\\\Providers;\\n\\nuse Illuminate\\\\Support\\\\Facades\\\\URL;\\n",
+    $c, 1);
+}
+
+if(strpos($c,"URL::forceScheme")===false){
+  $c=preg_replace("/public function boot\\(\\)\\s*\\{\\s*/",
+    "public function boot()\\n    {\\n        if (env(\\x27FORCE_HTTPS\\x27, false) || config(\\x27app.env\\x27) === \\x27production\\x27) {\\n            URL::forceScheme(\\x27https\\x27);\\n        }\\n\\n",
+    $c, 1);
+}
+
+file_put_contents($f,$c);
+'
+
+# 3) Limpa caches pra não ficar preso em config antiga (http)
+RUN php artisan optimize:clear || true
